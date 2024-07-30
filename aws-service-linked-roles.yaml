@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create service-linked role if it doesn't already exist
+
+Resources:
+  # CreateAWSServiceLinkedRolesExecutionRole - The AWS Lambda execution
+  # role for the custom CloudFormation resources that are used to create the
+  # service-linked role.
+  CreateAWSServiceLinkedRolesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                  - iam:GetRole
+                  - iam:ListRoles
+                Resource: "*"
+
+  CreateAWSServiceLinkedRolesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt CreateAWSServiceLinkedRolesExecutionRole.Arn
+      Runtime: "python3.11"
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import urllib.request
+          import re
+          from botocore.exceptions import ClientError
+
+          def handler(event, context):
+            print('event =', json.dumps(event))
+
+            if event['RequestType'] in ['Delete', 'Update']:
+              responseData = {}
+              cfnresponse.send(
+                event,
+                context,
+                cfnresponse.SUCCESS,
+                responseData
+              )
+              return
+
+            client = boto3.client('iam')
+
+            ####
+            # Find all existing services roles in current AWS account
+            ####
+            service_roles_exist=set()
+            service_role_prefix = '/aws-service-role/'
+            paginator = client.get_paginator('list_roles')
+            marker = None
+            response_iterator = paginator.paginate(
+              PathPrefix=service_role_prefix,
+              PaginationConfig={
+                'PageSize': 2,
+                'StartingToken': marker})
+            for page in response_iterator:
+                roles = page['Roles']
+                for role in roles:
+                    service_roles_exist.add(role['Path'].removeprefix(service_role_prefix).removesuffix('/'))
+            print("Service roles exist:", service_roles_exist)
+
+
+            ####
+            # Ref: https://github.com/plus3it/terraform-aws-tardigrade-service-linked-roles
+            # Not all service linked role can be created.
+            # Some exhibit flaky behavior when being deleted some generally created by AWS Organizations. These roles will be skipped
+            ####
+            service_roles_to_create={
+                "access-analyzer.amazonaws.com",
+                "accountdiscovery.ssm.amazonaws.com",
+                "appmesh.amazonaws.com",
+                "appstream.application-autoscaling.amazonaws.com",
+                "autoscaling-plans.amazonaws.com",
+                "cassandra.application-autoscaling.amazonaws.com",
+                "chime.amazonaws.com",
+                "cks.kms.amazonaws.com",
+                "cloud9.amazonaws.com",
+                "cloudhsm.amazonaws.com",
+                "cloudtrail.amazonaws.com",
+                "cloudwatch-crossaccount.amazonaws.com",
+                "codeguru-profiler.amazonaws.com",
+                "codeguru-reviewer.amazonaws.com",
+                "codestar-notifications.amazonaws.com",
+                "compute-optimizer.amazonaws.com",
+                "config.amazonaws.com",
+                "connect.amazonaws.com",
+                "continuousexport.discovery.amazonaws.com",
+                "dax.amazonaws.com",
+                "ecs.amazonaws.com",
+                "eks-nodegroup.amazonaws.com",
+                "eks.amazonaws.com",
+                "elasticache.amazonaws.com",
+                "elasticbeanstalk.amazonaws.com",
+                "elasticfilesystem.amazonaws.com",
+                "elasticloadbalancing.amazonaws.com",
+                "elasticmapreduce.amazonaws.com",
+                "email.cognito-idp.amazonaws.com",
+                "es.amazonaws.com",
+                "fms.amazonaws.com",
+                "fsx.amazonaws.com",
+                "globalaccelerator.amazonaws.com",
+                "guardduty.amazonaws.com",
+                "inspector.amazonaws.com",
+                "iotsitewise.amazonaws.com",
+                "lakeformation.amazonaws.com",
+                "lex.amazonaws.com",
+                "logger.cloudfront.amazonaws.com",
+                "macie.amazonaws.com",
+                "maintenance.elasticbeanstalk.amazonaws.com",
+                "managedupdates.elasticbeanstalk.amazonaws.com",
+                "management.chatbot.amazonaws.com",
+                "networkmanager.amazonaws.com",
+                "opensearchservice.amazonaws.com",
+                "ops.apigateway.amazonaws.com",
+                "organizations.amazonaws.com",
+                "rds.amazonaws.com",
+                "redshift.amazonaws.com",
+                "replicator.lambda.amazonaws.com",
+                "robomaker.amazonaws.com",
+                "securityhub.amazonaws.com",
+                "sms.amazonaws.com",
+                "ssm.amazonaws.com",
+                "sso.amazonaws.com",
+                "support.amazonaws.com",
+                "transitgateway.amazonaws.com",
+                "trustedadvisor.amazonaws.com",
+                "voiceconnector.chime.amazonaws.com",
+                "wafv2.amazonaws.com",
+                "worklink.amazonaws.com"}
+            service_roles_to_skip={
+                "cloudtrail.amazonaws.com",
+                "codeguru-profiler.amazonaws.com",
+                "elasticfilesystem.amazonaws.com",
+                "fms.amazonaws.com",
+                "fsx.amazonaws.com",
+                "networkmanager.amazonaws.com",
+                "organizations.amazonaws.com",
+                "replicator.lambda.amazonaws.com",
+                "ssm.amazonaws.com",
+                "sso.amazonaws.com",
+                "support.amazonaws.com",
+                "transitgateway.amazonaws.com",
+                "trustedadvisor.amazonaws.com"}
+
+            ####
+            # Find all service linked roles from AWS IAM policy generator
+            # Please note:
+            # 1) Some service linked roles are missing when compared with the list above. So we need to merge both list together
+            # 2) Some service linked roles are duplicated.
+            ####
+            with urllib.request.urlopen("https://awsiamconsole.s3.amazonaws.com/iam/assets/js/bundles/policies.js") as response:
+              policies = response.read().decode('utf-8')
+              principals = re.findall(r'\bprincipal:"[^"]*"', policies)
+              for principal in principals:
+                service_role = principal.removeprefix('principal:"').removesuffix('"')
+                if service_role not in service_roles_to_skip: #Skip those roles no need to create
+                  service_roles_to_create.add(service_role) #There might be duplicates
+
+              ####
+              # We have the complete service linked role list to create in service_roles_to_create
+              # then we create the role if not exist yet
+              ####
+              for service_role in service_roles_to_create:
+                if service_role not in service_roles_exist:
+                  print("create service role:", service_role)
+
+                  try:
+                    client.create_service_linked_role(AWSServiceName=service_role)
+                  except ClientError as e:
+                    print(e)
+                    responseData = {}
+                    cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      responseData
+                    )
+
+            responseData = {}
+            cfnresponse.send(
+              event,
+              context,
+              cfnresponse.SUCCESS,
+              responseData
+            )
+
+  CreateAWSServiceLinkedRoles:
+    Type: Custom::CreateAWSServiceLinkedRoles
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      ServiceToken: !GetAtt CreateAWSServiceLinkedRolesFunction.Arn
